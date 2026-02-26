@@ -3,6 +3,7 @@ import os
 from typing import BinaryIO
 import regex as re
 from collections import defaultdict
+import time
 
 __version__ = importlib.metadata.version("cs336_basics")
 
@@ -15,12 +16,11 @@ class BPE():
         self.new_id = 256
         self.merges = []
         self.pre_tokens = defaultdict(int)
-        
     
     
     def add_special_tokens(self, special_tokens: list[str]):
-        for str in special_tokens:
-            self.vocab[self.new_id] = str
+        for s in special_tokens:
+            self.vocab[self.new_id] = s.encode('utf-8') ## Remember to always convert to bytes
             self.new_id += 1
     
     def pre_tokenization(self, text, pat = PAT, special_tokens = []):
@@ -33,40 +33,40 @@ class BPE():
         
         for part in parts: 
             for m in re.finditer(pat, part):
-                self.pre_tokens[tuple(list(m.group()))] += 1
+                '''
+                Note that here the keys to the pre_tokens are tuples of integers
+                This is actually desired because bytes can't exceed 255.
+                So after merges, you can't store bytes([256]) in the key
+                '''
+                self.pre_tokens[tuple(m.group().encode(encoding='utf-8'))] += 1
         
-        print(self.pre_tokens)
         
         
     
     def train_bpe(self, input_path, vocab_size, special_tokens):
-        
-        
-        
-        with open(input_path) as f:
+        with open(input_path, encoding='utf-8') as f:
             file = f.read()
-        
-        self.pre_tokenization(file)
-        while self.new_id < vocab_size - 1:
+        self.add_special_tokens(special_tokens)
+        self.pre_tokenization(text = file, special_tokens= special_tokens)
+        while len(self.vocab) < vocab_size:
             self.pairs = defaultdict(int)
             for k in self.pre_tokens.keys():
                 for i in range(len(k) -1):
-                    self.pairs[tuple(k[i:i+2])] += self.pre_tokens[k]
-                    ### Left off here for the merge step, merge the pair with the largest count, if multiple, sort by lexicographics.
+                    self.pairs[k[i:i+2]] += self.pre_tokens[k]
                     
             
-            max_key = max(self.pairs, key= lambda x: (self.pairs[x], x))
-            print(max_key,self.pairs[max_key])
-            self.merges.append(max_key)
-            self.vocab[self.new_id] = max_key
-            self.new_id += 1
+            max_key = max(self.pairs, key= lambda x: (self.pairs[x], self.vocab[x[0]], self.vocab[x[1]]))
+            # print(max_key,self.pairs[max_key])
+            self.merges.append((self.vocab[max_key[0]], self.vocab[max_key[1]]))
+            self.vocab[self.new_id] = self.vocab[max_key[0]] + self.vocab[max_key[1]]
+            
             new_pre_tokens = defaultdict(int)
             for k in self.pre_tokens.keys():
                 new_key = []
                 i = 0
                 while i < len(k):
                     if i < len(k) - 1 and k[i:i+2] == max_key:
-                        new_key.append(k[i] + k[i+1])
+                        new_key.append(self.new_id)
                         i += 2
                     
                     else:
@@ -76,7 +76,8 @@ class BPE():
                 new_pre_tokens[tuple(new_key)] = self.pre_tokens[k]
             
             self.pre_tokens = new_pre_tokens
-            print("self.pretokens", self.pre_tokens)
+            self.new_id += 1
+            # print("self.pretokens", self.pre_tokens)
         
         return self.vocab, self.merges
                 
@@ -136,5 +137,7 @@ class BPE():
 
 
 bpe = BPE()
+t1 = time.time()
 # print(bpe.train_bpe('../data/mini.txt', 260, []))
-print(bpe.train_bpe('../data/mini.txt', 263, [])[1])
+vocab, merges = bpe.train_bpe('../data/TinyStories.txt', 10, ["<|endoftext|>"])
+print(time.time() - t1)

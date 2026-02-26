@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
+from cs336_basics import BPE
 
 def run_linear(
     d_in: int,
@@ -590,4 +590,5 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     
-    
+    bpe = BPE()
+    return bpe.train_bpe(input_path, vocab_size, special_tokens)
