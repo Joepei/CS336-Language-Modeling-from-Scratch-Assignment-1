@@ -4,11 +4,39 @@ from typing import BinaryIO
 import regex as re
 from collections import defaultdict
 import time
+import multiprocessing as mp
 
 __version__ = importlib.metadata.version("cs336_basics")
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+NUM_PROCESS = 12
+
+def pretokenize_chunk(input_path, start, end, pat, special_tokens):
+    pre_tokens = defaultdict(int)
+    with open(input_path, 'rb') as f:
+            f.seek(start)
+            # Binary mode ('rb') preserves raw bytes — no automatic line ending normalization.
+            # On Windows, files may have \r\n (carriage return + newline) instead of just \n.
+            # The reference snapshot was created on Linux (text mode, auto-normalizes \r\n -> \n),
+            # so we must manually normalize here to match. \r\n must be replaced before \r
+            # to avoid double-converting \r\n into two \n's.
+            text = f.read(end - start).decode(encoding= 'utf-8').replace('\r\n', '\n').replace('\r', '\n')
+    parts = [text]
+    if special_tokens:
+        pattern = "|".join(re.escape(t) for t in special_tokens)
+        parts = re.split(pattern, text)
+    
+    
+    for part in parts: 
+        for m in re.finditer(pat, part):
+            '''
+            Note that here the keys to the pre_tokens are tuples of integers
+            This is actually desired because bytes can't exceed 255.
+            So after merges, you can't store bytes([256]) in the key
+            '''
+            pre_tokens[tuple(m.group().encode(encoding='utf-8'))] += 1
+    return pre_tokens
 
 class BPE():
     def __init__(self):
@@ -23,31 +51,25 @@ class BPE():
             self.vocab[self.new_id] = s.encode('utf-8') ## Remember to always convert to bytes
             self.new_id += 1
     
-    def pre_tokenization(self, text, pat = PAT, special_tokens = []):
+    def pre_tokenization(self, input_path, pat = PAT, special_tokens = []):
+        with open(input_path, 'rb') as f:
+            chunk_boundaries = self.find_chunk_boundaries(f, NUM_PROCESS, b"<|endoftext|>")
+        with mp.Pool(processes=NUM_PROCESS) as pool:
+            inputs = [(input_path, start, end, pat, special_tokens) for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]
+            results = pool.starmap(pretokenize_chunk, inputs)
         
-        parts = [text]
-        if special_tokens:
-            pattern = "|".join(re.escape(t) for t in special_tokens)
-            parts = re.split(pattern, text)
-        
-        
-        for part in parts: 
-            for m in re.finditer(pat, part):
-                '''
-                Note that here the keys to the pre_tokens are tuples of integers
-                This is actually desired because bytes can't exceed 255.
-                So after merges, you can't store bytes([256]) in the key
-                '''
-                self.pre_tokens[tuple(m.group().encode(encoding='utf-8'))] += 1
-        
+        for result in results:
+            # print(result)
+            for key, value in result.items():
+                self.pre_tokens[key] += value
         
         
     
     def train_bpe(self, input_path, vocab_size, special_tokens):
-        with open(input_path, encoding='utf-8') as f:
-            file = f.read()
+        # with open(input_path, encoding='utf-8') as f:
+        #     file = f.read()
         self.add_special_tokens(special_tokens)
-        self.pre_tokenization(text = file, special_tokens= special_tokens)
+        self.pre_tokenization(input_path, special_tokens= special_tokens)
         while len(self.vocab) < vocab_size:
             self.pairs = defaultdict(int)
             for k in self.pre_tokens.keys():
@@ -81,9 +103,6 @@ class BPE():
         
         return self.vocab, self.merges
                 
-                
-                
-                        
                     
         
         
@@ -135,9 +154,13 @@ class BPE():
         return sorted(set(chunk_boundaries))
 
 
-
-bpe = BPE()
-t1 = time.time()
-# print(bpe.train_bpe('../data/mini.txt', 260, []))
-vocab, merges = bpe.train_bpe('../data/TinyStories.txt', 10, ["<|endoftext|>"])
-print(time.time() - t1)
+if __name__ == '__main__':
+    try:
+        bpe = BPE()
+        t1 = time.time()
+        # print(bpe.train_bpe('../data/mini.txt', 260, []))
+        vocab, merges = bpe.train_bpe('../data/TinyStories.txt', 10000, ["<|endoftext|>"])
+        print(merges)
+        print(time.time() - t1)
+    except KeyboardInterrupt:
+        print("Interrupted")
