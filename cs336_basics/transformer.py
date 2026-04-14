@@ -97,19 +97,87 @@ class RotaryPositionalEmbedding(nn.Module):
         self.d_k = d_k                                                                                 
     
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
-        R = torch.zeros((len(token_positions), self.d_k, self.d_k))
+        
         cos = self.cos_buffer[token_positions]
         sin = self.sin_buffer[token_positions]
-        for i in range(len(R)):
-            for j in range(0, self.d_k, 2):
-                R[i][j][j] = cos[i][j//2]
-                R[i][j+1][j+1] = cos[i][j//2]
-                R[i][j][j+1] = -sin[i][j//2]
-                R[i][j+1][j] = sin[i][j//2]
         
+       
+        # ## Slow way of constructing R
+        # R = torch.zeros((len(token_positions), self.d_k, self.d_k))
+
+        # for i in range(len(R)):
+        #     for j in range(0, self.d_k, 2):
+        #         R[i][j][j] = cos[i][j//2]
+        #         R[i][j+1][j+1] = cos[i][j//2]
+        #         R[i][j][j+1] = -sin[i][j//2]
+        #         R[i][j+1][j] = sin[i][j//2]
         # dim(R) = (len(token_positions)  d_k  d_k)
         # dim(x) = (batch  seq_len  d_k )
         # R @ x -> (batch  seq_len  d_k )?
-        return einsum(R, x, "seq_len d_k1 d_k2, batch seq_len d_k2 -> batch seq_len d_k1")
+        # return einsum(R, x, "seq_len d_k1 d_k2, batch seq_len d_k2 -> batch seq_len d_k1")
+        x = x.clone()  # So you don't mutate x. It might be used in other functions as well.
+        x_even = x[..., ::2].clone()
+        x_odd = x[..., 1::2].clone()
+        x[..., ::2] = x_even * cos - x_odd * sin # PyTorch broadcasts from the right, so not need to unsqueeze sin and cos buffers.
+        x[..., 1::2]= x_even * sin + x_odd * cos
+        return x
+
+def apply_softmax(x: torch.Tensor, dim: int):     
+    shifted = x - x.max(dim = dim, keepdim = True).values #Subtract the max value to avoid numerical instability
+    exp_x = shifted.exp()
+    return exp_x/exp_x.sum(dim = dim, keepdim = True)
+
+
+def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    d_k = Q.shape[-1]
+    pre_softmax = einsum(Q, K, 'batch ... len_query d_k, batch ... len_key d_k -> batch ... len_query len_key')/(d_k ** 0.5)
+    if mask is not None:
+        pre_softmax = torch.where(mask, pre_softmax, -torch.inf)
+    
+    normalized = apply_softmax(pre_softmax, -1)
+    return einsum(normalized, V, "batch ... len_query len_key, batch ... len_key d_v -> batch ... len_query d_v")
+
+class multihead_self_attention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, theta: float = None, max_seq_len: int = None, device = None):
+        super().__init__()
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.WQ = Linear(in_features = d_model, out_features = num_heads * self.d_k, device = device)
+        self.WK = Linear(in_features = d_model, out_features = num_heads * self.d_k, device = device)
+        self.WV = Linear(in_features = d_model, out_features = num_heads * self.d_v, device = device)
+        self.WO = Linear(in_features = num_heads * self.d_v, out_features = d_model, device = device)
+        self.num_heads = num_heads
+        if theta is not None and max_seq_len is not None:
+            self.rope = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device)
+        else:
+            self.rope = None
         
+    def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
+        Q = self.WQ(x)
+        K = self.WK(x)
+        V = self.WV(x)
+        """
+        rearrange does not affect backpropagation
+        it is just a view operation - just reshapes the tensor without copying data.
+        PyTorch's autograd tracks it transparently, so gradients flow back through it correctly as if it never happened.
+        """
+        Q = rearrange(Q, "batch seq_len (h d_k) -> batch h seq_len d_k", h = self.num_heads)
+        K = rearrange(K, "batch seq_len (h d_k) -> batch h seq_len d_k", h = self.num_heads)
+        V = rearrange(V, "batch seq_len (h d_v) -> batch h seq_len d_v", h = self.num_heads)
+        if self.rope is not None:
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
+            
+        seq_len = x.shape[-2]
         
+        """
+        Note that here uses lower triangle, not upper. 
+        To understand, need to refer back to pre_softmax in scaled_dot_product_attention
+        The last two dimension for pre_softmax is (len_query, len_key). So the ij^th position 
+        of the pre_softmax attention matrix is treating each row as each token in the query. 
+        So first row should keep only the first attn, second row keeps two, etcs. Hence the lower-triangular structure.
+        """
+        mask = torch.tril(torch.ones(seq_len, seq_len)).bool() #0.0 from torch.tril would be evaluated to True, need this .bool() to covnert to True/False.
+        attn = scaled_dot_product_attention(Q, K, V, mask)
+        concat_attn = rearrange(attn, "batch h seq_len d_model -> batch seq_len (h d_model)")
+        return self.WO(concat_attn)
