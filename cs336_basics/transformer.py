@@ -45,7 +45,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
-        self.W = nn.Parameter(torch.ones(d_model))
+        self.W = nn.Parameter(torch.ones(d_model, device = device))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x of shape (batch_size, seq_length, d_model)
@@ -73,7 +73,7 @@ class FFN(nn.Module):
         Also ensuring the dimensionality of the inner feed-forward layer is a multiple of 64 to make good use of hardware.
         """
         if not d_ff:
-            self.d_ff = d_model * 8 / 3 //64 * 64
+            self.d_ff = int(d_model * 8 / 3 //64 * 64)
         else:
             self.d_ff = d_ff
         self.W1 = Linear(self.d_model, self.d_ff)
@@ -137,7 +137,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     normalized = apply_softmax(pre_softmax, -1)
     return einsum(normalized, V, "batch ... len_query len_key, batch ... len_key d_v -> batch ... len_query d_v")
 
-class multihead_self_attention(nn.Module):
+class Multihead_self_attention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, theta: float = None, max_seq_len: int = None, device = None):
         super().__init__()
         self.d_k = d_model // num_heads
@@ -165,6 +165,10 @@ class multihead_self_attention(nn.Module):
         K = rearrange(K, "batch seq_len (h d_k) -> batch h seq_len d_k", h = self.num_heads)
         V = rearrange(V, "batch seq_len (h d_v) -> batch h seq_len d_v", h = self.num_heads)
         if self.rope is not None:
+            if token_positions is None:
+                # token_positions is range(0, seq_len)
+                # Need this because if token_positions = None, then in RoPE, cos_buffer[None] and sin_buffer[None] would create a new empty dimension at the beginniner (similar to how tensor.unsqueeze(0) works, which creates shape mismatch)
+                token_positions = torch.arange(x.shape[-2], device= x.device)
             Q = self.rope(Q, token_positions)
             K = self.rope(K, token_positions)
             
@@ -177,7 +181,44 @@ class multihead_self_attention(nn.Module):
         of the pre_softmax attention matrix is treating each row as each token in the query. 
         So first row should keep only the first attn, second row keeps two, etcs. Hence the lower-triangular structure.
         """
-        mask = torch.tril(torch.ones(seq_len, seq_len)).bool() #0.0 from torch.tril would be evaluated to True, need this .bool() to covnert to True/False.
+        mask = torch.tril(torch.ones(seq_len, seq_len, device = x.device)).bool() #0.0 from torch.tril would be evaluated to True, need this .bool() to covnert to True/False.
         attn = scaled_dot_product_attention(Q, K, V, mask)
         concat_attn = rearrange(attn, "batch h seq_len d_model -> batch seq_len (h d_model)")
         return self.WO(concat_attn)
+    
+
+class Transformer_block(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, theta: float = None, max_seq_len: int = None, device = None):
+        super().__init__()
+        self.norm_1 = RMSNorm(d_model= d_model, device= device)
+        self.multi_head_attention = Multihead_self_attention(d_model= d_model, num_heads= num_heads, theta= theta, max_seq_len= max_seq_len, device=device)
+        self.norm_2 = RMSNorm(d_model= d_model, device= device)
+        self.ff = FFN(d_model= d_model, d_ff = d_ff)
+    
+    def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
+        x = x + self.multi_head_attention(self.norm_1(x), token_positions = token_positions)
+        x = x + self.ff(self.norm_2(x))
+        return x
+
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size, context_length, num_layers, d_model, num_heads, d_ff, theta: float = None,  device = None):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context = context_length
+        self.embedding = Embedding(num_embeddings= vocab_size, embedding_dim= d_model, device=device)
+        self.transformer_blocks = nn.ModuleList()
+        for _ in range(num_layers):
+            self.transformer_blocks.append(Transformer_block(d_model= d_model, num_heads= num_heads, d_ff = d_ff, theta= theta, max_seq_len = context_length, device= device))
+        
+        self.norm_pre_out = RMSNorm(d_model= d_model, device= device)
+        self.output_embedding = Linear(in_features= d_model, out_features= vocab_size, device= device)
+    
+    def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
+        x = self.embedding(x)
+        for block in self.transformer_blocks:
+            x = block(x, token_positions)
+        x = self.norm_pre_out(x)
+        x = self.output_embedding(x)
+        return x
+        
