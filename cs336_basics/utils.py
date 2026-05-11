@@ -92,7 +92,7 @@ def gradient_clipping(parameters, maximum, eps = 1e-6):
                 
 def data_loading(x, batch_size, context_length, device: str):
     n = len(x)
-    indices = np.random.choice(n-context_length, batch_size, replace= False)
+    indices = np.random.randint(0, n - context_length, batch_size)
     
     rolling_indices = np.array(indices)[:, None] + np.arange(context_length)
     

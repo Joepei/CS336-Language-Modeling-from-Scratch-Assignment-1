@@ -2,6 +2,7 @@ from torch import nn
 import torch
 from einops import rearrange, einsum
 import math
+from cs336_basics.utils import apply_softmax
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device = None, dtype = None):
@@ -122,10 +123,7 @@ class RotaryPositionalEmbedding(nn.Module):
         x[..., 1::2]= x_even * sin + x_odd * cos
         return x
 
-def apply_softmax(x: torch.Tensor, dim: int):     
-    shifted = x - x.max(dim = dim, keepdim = True).values #Subtract the max value to avoid numerical instability
-    exp_x = shifted.exp()
-    return exp_x/exp_x.sum(dim = dim, keepdim = True)
+
 
 
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
