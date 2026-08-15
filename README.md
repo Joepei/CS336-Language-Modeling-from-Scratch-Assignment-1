@@ -30,6 +30,20 @@ Initially, all tests should fail with `NotImplementedError`s.
 To connect your implementation to the tests, complete the
 functions in [./tests/adapters.py](./tests/adapters.py).
 
+## Analyze experiments
+
+Training runs write a CSV log and a neighboring `.config.json` metadata file.
+Aggregate those logs and render the standard experiment plots with:
+
+```sh
+uv run python -m cs336_basics.analyze_experiments \
+    --log_dir logs \
+    --output_dir results/experiments
+```
+
+The output directory contains `summary.csv` plus validation-loss, throughput,
+batch-size, and model-size plots when the required metrics are available.
+
 ### Download data
 Download the TinyStories data and a subsample of OpenWebText
 

@@ -2,6 +2,7 @@ import torch
 import math
 import random
 import numpy as np
+import copy
 
 def apply_softmax(x: torch.Tensor, dim: int):     
     shifted = x - x.max(dim = dim, keepdim = True).values #Subtract the max value to avoid numerical instability
@@ -78,6 +79,10 @@ def learning_rate_schedule(t, alpha_max, alpha_min, Tw, Tc):
     
 
 def gradient_clipping(parameters, maximum, eps = 1e-6):
+    # model.parameters() returns a one-shot iterator. Materialize it so the
+    # same parameters are available when computing and applying the clip.
+    parameters = list(parameters)
+
     norm = 0
     for theta in parameters:
         if theta.grad is not None:
@@ -88,11 +93,22 @@ def gradient_clipping(parameters, maximum, eps = 1e-6):
         for theta in parameters:
             if theta.grad is not None:
                 theta.grad *= maximum / (norm + eps)
+
+    return norm
                 
                 
-def data_loading(x, batch_size, context_length, device: str):
+def data_loading(
+    x,
+    batch_size,
+    context_length,
+    device: str,
+    rng: np.random.Generator | None = None,
+):
     n = len(x)
-    indices = np.random.randint(0, n - context_length, batch_size)
+    if rng is None:
+        indices = np.random.randint(0, n - context_length, batch_size)
+    else:
+        indices = rng.integers(0, n - context_length, batch_size)
     
     rolling_indices = np.array(indices)[:, None] + np.arange(context_length)
     
@@ -101,42 +117,125 @@ def data_loading(x, batch_size, context_length, device: str):
     
     return inputs, targets
 
-def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out: str):
-    torch.save({'Model': model.state_dict(), 'Optimizer': optimizer.state_dict(), 'Iteration': iteration}, out)
+def capture_rng_state(train_rng: np.random.Generator | None = None):
+    numpy_state = np.random.get_state()
+    state = {
+        "python_random": random.getstate(),
+        "numpy_random": {
+            "bit_generator": numpy_state[0],
+            "state": torch.from_numpy(numpy_state[1].copy()),
+            "position": numpy_state[2],
+            "has_gauss": numpy_state[3],
+            "cached_gaussian": numpy_state[4],
+        },
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+    if train_rng is not None:
+        state["train_numpy_generator"] = copy.deepcopy(train_rng.bit_generator.state)
+    return state
 
-def load_checkpoint(src: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer):
-    d = torch.load(src, map_location='cpu')
+
+def restore_rng_state(state, train_rng: np.random.Generator | None = None):
+    if not state:
+        return
+
+    random.setstate(state["python_random"])
+    numpy_state = state["numpy_random"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            numpy_state["state"].cpu().numpy().astype(np.uint32, copy=True),
+            numpy_state["position"],
+            numpy_state["has_gauss"],
+            numpy_state["cached_gaussian"],
+        )
+    )
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if torch.cuda.is_available() and state.get("torch_cuda"):
+        torch.cuda.set_rng_state_all([rng_state.cpu() for rng_state in state["torch_cuda"]])
+    if train_rng is not None and "train_numpy_generator" in state:
+        train_rng.bit_generator.state = copy.deepcopy(state["train_numpy_generator"])
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str,
+    rng_state=None,
+    training_state=None,
+):
+    checkpoint = {
+        "Model": model.state_dict(),
+        "Optimizer": optimizer.state_dict(),
+        "Iteration": iteration,
+    }
+    if rng_state is not None:
+        checkpoint["RNG"] = rng_state
+    if training_state is not None:
+        checkpoint["TrainingState"] = training_state
+    torch.save(checkpoint, out)
+
+def load_checkpoint(
+    src: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    return_extra_state: bool = False,
+):
+    d = torch.load(src, map_location="cpu", weights_only=True)
     model.load_state_dict(d['Model'])    
     optimizer.load_state_dict(d['Optimizer'])
+    if return_extra_state:
+        return d['Iteration'], d.get("RNG"), d.get("TrainingState", {})
     return d['Iteration']
 
 
 
 
-def decode(inputs, model, max_context_window, temperature, p, eos_token_id = None):
-    
-    len_inputs = len(inputs)
-    start = len_inputs
-    latest_token_id = -1
-    while start < max_context_window and (eos_token_id is None or latest_token_id != eos_token_id):
-        with torch.no_grad():
-            logits = model(torch.tensor(inputs).unsqueeze(0))[0, -1, :]
-    
-        probs = apply_softmax(logits/temperature, -1)
-        
-        # torch.sort gives both values and original vocab indices
-        sorted_probs, sorted_indices = torch.sort(probs, descending= True) 
+def decode(
+    inputs,
+    model,
+    max_context_window,
+    temperature,
+    p,
+    eos_token_id=None,
+    max_new_tokens=None,
+):
+    if not inputs:
+        raise ValueError("Generation requires at least one input token.")
+    if temperature <= 0:
+        raise ValueError("temperature must be greater than zero.")
+    if not 0 < p <= 1:
+        raise ValueError("top-p must be in the interval (0, 1].")
+    if max_new_tokens is None:
+        max_new_tokens = max(0, max_context_window - len(inputs))
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative.")
 
-        
-        cumsum = torch.cumsum(sorted_probs, dim = 0)
-        
-        to_remove = (cumsum - sorted_probs) >= p #happens when cumsum does not need this prob to be larger than p, meaning cumsum >= p already reached.
-        sorted_probs[to_remove] = 0.0
-        
-        sampled = torch.multinomial(sorted_probs, num_samples= 1)
-        latest_token_id = sorted_indices[sampled].item()
-        inputs.append(latest_token_id)
-        start += 1
-        
-    return inputs[len_inputs:]
-    
+    generated = list(inputs)
+    prompt_length = len(generated)
+    device = next(model.parameters()).device
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            # Once the sequence exceeds the model context, retain the most
+            # recent tokens rather than silently stopping generation.
+            context = generated[-max_context_window:]
+            model_input = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(model_input)[0, -1, :]
+            probs = apply_softmax(logits / temperature, -1)
+
+            # Keep the smallest high-probability prefix whose mass reaches p.
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=0)
+            to_remove = (cumsum - sorted_probs) >= p
+            sorted_probs[to_remove] = 0.0
+
+            sampled = torch.multinomial(sorted_probs, num_samples=1)
+            latest_token_id = sorted_indices[sampled].item()
+            generated.append(latest_token_id)
+            if eos_token_id is not None and latest_token_id == eos_token_id:
+                break
+
+    return generated[prompt_length:]

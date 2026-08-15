@@ -4,6 +4,11 @@ from einops import rearrange, einsum
 import math
 from cs336_basics.utils import apply_softmax
 
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
+
+
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device = None, dtype = None):
         super().__init__()
@@ -83,7 +88,7 @@ class FFN(nn.Module):
         
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         gate = self.W1(x) # to save compute
-        return self.W2(gate*torch.sigmoid(gate) * self.W3(x))
+        return self.W2(silu(gate) * self.W3(x))
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -207,7 +212,7 @@ class TransformerLM(nn.Module):
         self.embedding = Embedding(num_embeddings= vocab_size, embedding_dim= d_model, device=device)
         self.transformer_blocks = nn.ModuleList()
         for _ in range(num_layers):
-            self.transformer_blocks.append(Transformer_block(d_model= d_model, num_heads= num_heads, d_ff = d_ff, theta= theta, max_seq_len = context_length, device= device))
+            self.transformer_blocks.append(Transformer_block(d_model = d_model, num_heads = num_heads, d_ff = d_ff, theta = theta, max_seq_len = context_length, device= device))
         
         self.norm_pre_out = RMSNorm(d_model= d_model, device= device)
         self.output_embedding = Linear(in_features= d_model, out_features= vocab_size, device= device)
@@ -219,4 +224,3 @@ class TransformerLM(nn.Module):
         x = self.norm_pre_out(x)
         x = self.output_embedding(x)
         return x
-        
