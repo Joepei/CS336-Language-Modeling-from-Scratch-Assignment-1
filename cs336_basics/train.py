@@ -191,6 +191,7 @@ def train():
 
         config_path = f"{args.log_file}.config.json"
         now_utc = datetime.now(timezone.utc).isoformat()
+        portable_command = ["python", "-m", "cs336_basics.train", *sys.argv[1:]]
         resume_existing_log = bool(
             args.resume and os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0
         )
@@ -218,7 +219,7 @@ def train():
                 {
                     "resumed_at_utc": now_utc,
                     "checkpoint": args.resume,
-                    "command": [sys.executable, *sys.argv],
+                    "command": portable_command,
                     "arguments": vars(args).copy(),
                 }
             )
@@ -227,7 +228,7 @@ def train():
             config = vars(args).copy()
             config.update(
                 {
-                    "command": [sys.executable, *sys.argv],
+                    "command": portable_command,
                     "started_at_utc": now_utc,
                     "torch_version": str(torch.__version__),
                     "model_parameters": sum(parameter.numel() for parameter in model.parameters()),

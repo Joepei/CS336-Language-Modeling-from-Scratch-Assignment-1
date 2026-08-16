@@ -240,7 +240,7 @@ def save_batch_plot(runs, metric, ylabel, title, output_path, select_min=False):
         value = run["summary"].get(metric)
         if batch_size is not None and value is not None:
             grouped[batch_size].append(value)
-    if not grouped:
+    if len(grouped) < 2:
         return False
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -328,6 +328,8 @@ def main():
         throughput_path,
     ):
         generated.append(throughput_path)
+    else:
+        throughput_path.unlink(missing_ok=True)
 
     batch_loss_path = output_dir / "validation_loss_vs_batch_size.png"
     if save_batch_plot(
@@ -339,6 +341,8 @@ def main():
         select_min=True,
     ):
         generated.append(batch_loss_path)
+    else:
+        batch_loss_path.unlink(missing_ok=True)
 
     parameter_path = output_dir / "validation_loss_vs_parameters.png"
     if save_parameter_plot(runs, parameter_path):
