@@ -1,0 +1,4 @@
+run,log_file,status,dataset,model_parameters,vocab_size,context_length,d_model,num_layers,num_heads,d_ff,batch_size,lr_max,total_steps,max_step,tokens_processed,wall_time_seconds,final_train_loss,best_val_loss,final_val_loss,median_tokens_per_second,peak_memory_mib
+model_23m_67m,model_23m_67m.csv,complete,TinyStories,22696448,10000,256,512,4,16,,32,0.001,8192,8191,67108864,968.27,1.54076,1.546922,1.546922,69283.18,4265.4
+model_58m_67m,model_58m_67m.csv,complete,TinyStories,57837312,10000,256,768,6,16,,32,0.001,8192,8191,67108864,1935.41,1.428636,1.437684,1.437684,34648.06,7370.55
+model_8m_67m,model_8m_67m.csv,complete,TinyStories,8136960,10000,256,256,4,8,,32,0.001,8192,8191,67108864,517.32,1.725221,1.723024,1.723024,129446.16,2684.45

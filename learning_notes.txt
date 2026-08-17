@@ -1,0 +1,714 @@
+=============================================================
+  LEARNING NOTES — CS336 Assignment 1 (BPE Tokenizer)
+=============================================================
+
+-------------------------------------------------------------
+1. PYTHON DICT MUTATION DURING ITERATION
+-------------------------------------------------------------
+You cannot modify a dict while iterating over it (.pop(), adding keys, etc.).
+This raises: RuntimeError: dictionary changed size during iteration
+
+Fix: build a NEW dict and replace the old one after iteration.
+
+    new_dict = defaultdict(int)
+    for k, v in old_dict.items():
+        new_key = transform(k)
+        new_dict[new_key] += v
+    self.pre_tokens = new_dict
+
+
+-------------------------------------------------------------
+2. BYTES vs INTEGERS vs STRINGS — THE TYPE TRIANGLE
+-------------------------------------------------------------
+Three types appear constantly in BPE. Keep them straight:
+
+    str    — Python text, e.g. "hello"
+    bytes  — raw bytes, e.g. b'\x68\x65\x6c\x6c\x6f'
+    int    — a single byte value (0-255), e.g. 104
+
+Conversions:
+    str   -> bytes:  s.encode('utf-8')
+    bytes -> str:    b.decode('utf-8')
+    bytes -> tuple of ints: tuple(b)   # iterating bytes yields ints
+    int   -> bytes:  bytes([i])
+
+KEY INSIGHT: pre_tokens keys are TUPLES OF INTEGERS, not bytes.
+Reason: after BPE merges, token IDs exceed 255 (e.g. 256, 257...).
+bytes([256]) raises ValueError. Tuples of ints have no such limit.
+
+    tuple(b'\x68\x69')     # (104, 105) — correct for pre_tokens keys
+    tuple(list(b'\x68\x69')) # same result, list() is redundant
+
+
+-------------------------------------------------------------
+3. VOCAB AND MERGES FORMAT
+-------------------------------------------------------------
+From the adapter type signatures:
+    vocab:  dict[int, bytes]           — token ID -> bytes
+    merges: list[tuple[bytes, bytes]]  — ordered list of merge pairs
+
+Common mistakes made:
+  - Storing str instead of bytes in vocab for special tokens
+      WRONG:  self.vocab[id] = "<|endoftext|>"
+      RIGHT:  self.vocab[id] = "<|endoftext|>".encode('utf-8')
+
+  - Storing tuple of ints instead of tuple of bytes in merges
+      WRONG:  self.merges.append(max_key)  # (104, 101) — two ints
+      RIGHT:  self.merges.append((self.vocab[max_key[0]], self.vocab[max_key[1]]))
+
+  - Doing integer addition instead of appending new token ID
+      WRONG:  new_key.append(k[i] + k[i+1])  # 104 + 101 = 205, wrong!
+      RIGHT:  new_key.append(new_token_id)    # the new merged token's ID
+
+  - Vocab value for merged token must be concatenated bytes:
+      self.vocab[new_id] = self.vocab[max_key[0]] + self.vocab[max_key[1]]
+
+
+-------------------------------------------------------------
+4. FILE READING — TEXT MODE vs BINARY MODE
+-------------------------------------------------------------
+Two layers when working with files:
+
+    Binary ('rb'): gives raw bytes, .seek() by exact byte offset
+    Text   ('r'):  automatically decodes bytes -> str
+
+    open('rb')          -> f.read() returns bytes
+    open('r', encoding='utf-8') -> f.read() returns str
+
+Why the parameter is called "encoding" not "decoding":
+    The same parameter applies to BOTH reading (decode) and writing (encode).
+    It describes the FORMAT of the data on disk, not the direction.
+
+When to use each mode:
+    Use 'rb' when you need exact byte positions (e.g. seeking to chunk boundaries).
+    Use 'r' (text mode) for simple full-file reads where you just want a string.
+
+Pattern for chunk-based binary reading:
+    with open(path, 'rb') as f:
+        f.seek(start)                          # jump to byte position
+        text = f.read(end - start).decode('utf-8')  # read N bytes, decode
+
+
+-------------------------------------------------------------
+5. WINDOWS LINE ENDINGS — A SUBTLE BUG
+-------------------------------------------------------------
+Different OS line ending conventions:
+    Unix/Linux/Mac: \n   (newline only)
+    Windows:        \r\n (carriage return + newline)
+    Old Mac (pre-OSX): \r only
+
+Python text mode ('r') automatically normalizes \r\n -> \n on all platforms.
+Python binary mode ('rb') gives you the raw bytes — NO normalization.
+
+THE BUG WE HIT:
+    - Reference snapshot created on Linux (or with text mode): only \n
+    - Our binary mode read preserved \r\n from the Windows file
+    - BPE trained on different pre-tokens -> different merges -> test fails
+    - Symptom: unexpected tokens b'\r\n', b' \r', b'\r\n\r' in vocab
+
+Fix: normalize manually after decoding in binary mode:
+    text = f.read(end - start).decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
+    # IMPORTANT: replace \r\n BEFORE \r, otherwise \r\n becomes \n\n
+
+
+-------------------------------------------------------------
+6. SPECIAL TOKENS IN PRE-TOKENIZATION
+-------------------------------------------------------------
+Special tokens (e.g. "<|endoftext|>") must:
+  1. Be added to vocab as bytes, NOT included in BPE pre-tokenization
+  2. The text must be SPLIT on special tokens before applying the regex
+
+    pattern = "|".join(re.escape(t) for t in special_tokens)
+    parts = re.split(pattern, text)
+
+  3. Must pass special_tokens all the way through the call chain
+       train_bpe -> pre_tokenization -> pretokenize_chunk
+     (Forgetting to pass them causes special token characters to be merged)
+
+Why re.escape: special tokens contain regex metacharacters like | and <>.
+re.escape ensures they're treated as literal strings.
+
+
+-------------------------------------------------------------
+7. MULTIPROCESSING IN PYTHON
+-------------------------------------------------------------
+GIL (Global Interpreter Lock):
+    Only ONE thread can run Python bytecode at a time.
+    -> Threads don't give real parallelism for CPU-bound work.
+    -> Use multiprocessing (separate processes) for CPU-bound tasks.
+
+multiprocessing.Pool:
+    Creates N worker processes, each with their own memory.
+    pool.map(fn, [a, b, c])    -> calls fn(a), fn(b), fn(c) in parallel
+    pool.starmap(fn, [(a,b,c)])-> unpacks tuples, calls fn(a, b, c)
+
+KEY RULES:
+  - Worker function must be defined at MODULE TOP LEVEL (not inside a class
+    or function). On Windows, processes are SPAWNED (fresh import), so the
+    function must be importable.
+  - Workers have SEPARATE MEMORY. They cannot write to self.pre_tokens.
+    Results must be RETURNED and merged in the parent process.
+  - Guard main code with: if __name__ == '__main__':
+    Otherwise every worker re-runs the top-level code on import,
+    causing infinite recursive spawning. This also applies to any
+    SCRIPT that calls multiprocessing code — not just the module itself.
+
+Pattern for parallel pre-tokenization:
+  1. Get chunk boundaries (find_chunk_boundaries)
+  2. Build list of (input_path, start, end, pat, special_tokens) tuples
+  3. pool.starmap(pretokenize_chunk, inputs) -> list of dicts
+  4. Merge all dicts into self.pre_tokens by summing counts
+
+Ctrl+C with multiprocessing on Windows:
+    KeyboardInterrupt goes to the main process but not workers.
+    Workers keep running, causing hangs.
+    Wrap main code in try/except KeyboardInterrupt.
+    Force kill: taskkill /F /IM python.exe
+
+MEMORY with large files:
+    Peak memory during processing can be 3-5x the raw file size due to
+    intermediate objects (raw bytes + decoded string + regex matches +
+    defaultdict all in memory simultaneously per worker).
+    Rule of thumb: NUM_WORKERS * chunk_size * 4 <= available RAM
+    For a 10GB file with 12 workers: 12 * ~830MB * 4 ~= 40GB peak -> OOM
+    Fix: reduce NUM_PROCESS (e.g. 2-4) for large files.
+
+PROFILING multiprocessing code:
+    Running `python -m cProfile script.py` won't profile worker processes
+    (they run in separate processes). Only the main process is profiled.
+    cProfile shows pre_tokenization time as mostly IPC/spawn overhead,
+    not the actual regex work happening in workers.
+
+
+-------------------------------------------------------------
+8. FIND_CHUNK_BOUNDARIES — HOW IT WORKS
+-------------------------------------------------------------
+Splits a binary file into N chunks aligned on a special token.
+Returns a list of N+1 byte offsets: [0, b1, b2, ..., file_size]
+
+Usage:
+    boundaries = find_chunk_boundaries(f, N, b"<|endoftext|>")
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        # chunk is bytes [start, end)
+
+Important: boundary is set at the START of the special token.
+    chunk[i]:   [b_i, b_{i+1})  — does NOT include <|endoftext|> at b_{i+1}
+    chunk[i+1]: [b_{i+1}, ...)  — STARTS WITH <|endoftext|>, split off by re.split
+
+Must pass an OPEN FILE OBJECT (BinaryIO), not a file path string.
+    WRONG:  find_chunk_boundaries(input_path, ...)   # AttributeError: str has no .seek
+    RIGHT:  with open(input_path, 'rb') as f:
+                find_chunk_boundaries(f, ...)
+
+
+-------------------------------------------------------------
+9. GIT WORKFLOW — PUSHING TO YOUR OWN REPO
+-------------------------------------------------------------
+To push a cloned repo to your personal GitHub:
+    git remote set-url origin https://github.com/YOU/YOUR_REPO.git
+    # or keep original as upstream:
+    git remote rename origin upstream
+    git remote add origin https://github.com/YOU/YOUR_REPO.git
+    git push -u origin main --force  # force needed if remote has auto-generated files
+
+Set identity before committing:
+    git config --global user.email "you@example.com"
+    git config --global user.name "Your Name"
+
+.venv is already in .gitignore — it won't be pushed.
+uv.lock is tracked but harmless — it's just a dependency lock file.
+
+
+-------------------------------------------------------------
+10. LEXICOGRAPHIC COMPARISON OF BYTES TUPLES
+-------------------------------------------------------------
+Python compares tuples element by element, left to right.
+bytes objects compare by their first differing byte value.
+
+    (b' c', b'om') vs (b't', b'h')
+    -> compare b' c' vs b't'
+    -> first byte: 32 (space) vs 116 ('t')
+    -> 32 < 116, so (b' c', b'om') < (b't', b'h')
+
+This is the tiebreaker used in BPE when two pairs have equal frequency:
+    max(pairs, key=lambda x: (count[x], vocab[x[0]], vocab[x[1]]))
+
+
+-------------------------------------------------------------
+11. SERIALIZING BPE VOCAB AND MERGES
+-------------------------------------------------------------
+vocab  (dict[int, bytes]) and merges (list[tuple[bytes, bytes]]) need
+to be saved to disk to reuse the tokenizer without retraining.
+
+PICKLE — simplest, handles all Python types natively:
+    import pickle
+    with open('vocab.pkl', 'wb') as f: pickle.dump(vocab, f)
+    with open('vocab.pkl', 'rb') as f: vocab = pickle.load(f)
+    Downsides: binary (not human-readable), Python-only.
+
+JSON — human-readable, inspectable with cat/browser, but needs conversion:
+    bytes are not JSON serializable. Use latin-1 encoding (lossless for
+    arbitrary bytes — maps byte values 0-255 to Unicode 0-255 one-to-one).
+    utf-8 would FAIL on arbitrary bytes (e.g. b'\x80\x81').
+
+    # Save vocab
+    json.dump({str(k): v.decode('latin-1') for k, v in vocab.items()}, f)
+    # Load vocab
+    vocab = {int(k): v.encode('latin-1') for k, v in json.load(f).items()}
+
+    JSON also requires dict keys to be strings, so int keys must be
+    converted: str(k) on save, int(k) on load.
+
+RECOMMENDATION:
+    vocab  -> JSON (you'll want to inspect it during debugging)
+    merges -> pickle (order matters, less need to inspect manually)
+
+LEADING SPACE IN TOKENS is normal and intentional (GPT-2 convention).
+" bold" != "bold" — the space distinguishes mid-sentence vs start-of-word.
+
+
+-------------------------------------------------------------
+12. PROFILING PYTHON CODE
+-------------------------------------------------------------
+Two key dimensions to profile:
+  - LATENCY: how long does it take (which functions are slow?)
+  - MEMORY:  how much RAM is used (which data structures are large?)
+
+LATENCY — cProfile:
+    python -m cProfile -s cumulative script.py   # prints to terminal
+    python -m cProfile -o out.prof script.py     # saves to file
+
+    Read saved output:
+    python -c "import pstats; p=pstats.Stats('out.prof'); p.sort_stats('cumulative'); p.print_stats(20)"
+
+    Reading the output columns:
+      ncalls  — number of times called
+      tottime — time in this function only (excluding callees)
+      cumtime — total time including all functions it called
+      percall — time per call
+
+    High cumtime at the top (exec, __main__, train_bpe) just reflects the
+    call hierarchy — not actual bottlenecks. Focus on functions with high
+    tottime or unexpectedly high ncalls.
+
+BPE profiling results on TinyStories (vocab=10000):
+    max() called 15,479 times -> 88s cumtime (biggest bottleneck)
+    lambda inside max() called 490 MILLION times -> 47s
+    pre_tokenization -> 37s (mostly IPC overhead, not actual compute)
+    Total: ~127s
+
+    Key insight: max() is O(|pairs|) and called ~9744 times.
+    Fix: use a heap (heapq) for O(log n) max instead of O(n) scan.
+    Python's heapq is a min-heap; negate counts to simulate max-heap.
+
+MEMORY — tracemalloc (built-in, no install needed):
+    import tracemalloc
+    tracemalloc.start()
+    # ... run code ...
+    current, peak = tracemalloc.get_traced_memory()
+    print(f"Current: {current/1e6:.1f} MB, Peak: {peak/1e6:.1f} MB")
+    tracemalloc.stop()
+
+    Note: wrap in if __name__ == '__main__': if using multiprocessing.
+
+memory_profiler (pip install memory-profiler) gives line-by-line memory
+but is very slow. tracemalloc is better for quick peak usage checks.
+
+MEMORY OPTIMIZATION NOTES:
+    self.pairs and self.pair_index never shrink because dead pairs are set
+    to 0 rather than deleted. After 9744 merges, ~9744 stale entries accumulate.
+    Fix: del self.pairs[max_key] instead of self.pairs[max_key] = 0.
+    Also del self.pair_index[max_key] after each merge is complete.
+    Similarly, pairs whose count drops to 0 during subtraction can be deleted.
+
+GPU vs CPU for BPE:
+    BPE training is sequential (each merge depends on previous) and uses
+    dynamic hash maps — not GPU-friendly. GPU helps enormously for
+    transformer training but not for tokenizer training.
+
+
+-------------------------------------------------------------
+13. PYTHON PACKAGES AND IMPORTS
+-------------------------------------------------------------
+Why `from cs336_basics import BPE` works without a relative path:
+    The package is INSTALLED in the uv virtual environment (editable mode).
+    pyproject.toml declares the package name and source directory.
+    Python finds it via the venv's site-packages, like any installed library.
+    It's NOT about file proximity — it's about installation.
+
+Path-style imports like `from ../cs336_basics/__init__.py import BPE`
+are NOT valid Python syntax.
+
+
+-------------------------------------------------------------
+14. RE.FINDALL vs RE.FINDITER
+-------------------------------------------------------------
+Both find all pattern matches, but:
+
+    re.findall  -> returns a list[str] (or list[tuple] if groups)
+                   computes ALL matches eagerly, loads into memory
+    re.finditer -> returns an Iterator[Match]
+                   lazy — one match at a time, memory efficient
+                   gives access to .start(), .end(), .span(), .group()
+
+Prefer finditer for large text (e.g. BPE pre-tokenization) because:
+  - text corpora can be huge — don't load all matches at once
+  - you often need byte offsets (.start(), .end()) for span tracking
+
+    for m in re.finditer(PAT, text):
+        print(m.group(), m.start(), m.end())
+
+
+-------------------------------------------------------------
+15. RE.SPLIT WITH CAPTURING GROUPS — KEEPING DELIMITERS
+-------------------------------------------------------------
+re.split(pattern, text)          -> delimiters are DISCARDED
+re.split("(pattern)", text)      -> delimiters are KEPT in the result
+
+When you already have a pattern variable, wrap it in a capturing group:
+    pattern = "|".join(re.escape(t) for t in special_tokens)
+    parts = re.split(f"({pattern})", text)   # <-- note the f"({pattern})"
+
+Example with special tokens:
+    re.split("(<|endoftext|>)", "hello<|endoftext|>world")
+    # ['hello', '<|endoftext|>', 'world']
+
+This allows you to iterate over parts and identify which are special
+tokens (emit their ID directly) vs regular text (run through BPE).
+
+Edge case: consecutive special tokens produce empty strings between them:
+    re.split("(<|endoftext|>)", "<|endoftext|><|endoftext|>")
+    # ['', '<|endoftext|>', '', '<|endoftext|>', '']
+Empty strings produce no pre-tokens (re.finditer on '' yields nothing).
+
+
+-------------------------------------------------------------
+16. BPE ENCODING ALGORITHM
+-------------------------------------------------------------
+encode(text) -> list[int]:
+
+Step 1: Split on special tokens (with capturing group to keep them)
+Step 2: For each part:
+  - If it's a special token -> look up its ID in vocab, emit directly
+  - Otherwise -> run re.finditer(PAT) to get pre-tokens as tuple[int]
+Step 3: For each pre-token, apply BPE merges:
+  - Precompute merge_rank: dict[(bytes, bytes) -> int] from self.merges
+  - Find the adjacent pair with the LOWEST rank (earliest learned merge)
+  - Apply that merge everywhere it appears in the sequence
+  - Repeat until no pair exists in merge_rank
+Step 4: Collect all resulting token IDs into a flat list[int]
+
+KEY INSIGHT — merge priority:
+    You do NOT just merge the first two tokens or merge left-to-right.
+    You must find the GLOBALLY highest-priority pair (lowest index in
+    self.merges) across all adjacent pairs, then apply it everywhere.
+
+Why special tokens need splitting:
+    Without splitting, "<|endoftext|>" gets broken into individual bytes
+    and the chars get merged by BPE (e.g. 'en' is an early merge).
+    This produces multiple IDs instead of the single special token ID.
+
+Output type: list[int] — token IDs (keys of vocab), NOT bytes.
+
+
+-------------------------------------------------------------
+17. VOCAB AND MERGES — TYPES ACROSS SAVE/LOAD
+-------------------------------------------------------------
+During BPE training:
+    vocab:  dict[int, bytes]           — ID -> raw bytes
+    merges: list[tuple[bytes, bytes]]  — ordered merge pairs
+
+After JSON round-trip (vocab):
+    JSON requires string keys and can't store bytes.
+    Save: {str(k): v.decode('latin-1') for k, v in vocab.items()}
+    Load: {int(k): v.encode('latin-1') for k, v in json.items()}
+    latin-1 is lossless for bytes 0-255 (unlike utf-8 which fails on b'\x80').
+
+After pickle round-trip (merges):
+    Types are preserved exactly — no conversion needed.
+
+In Tokenizer, you also want:
+    reverse_vocab:  dict[bytes, int]             — for encoding
+    reverse_merges: dict[(bytes, bytes), int]    — merge rank lookup
+
+
+-------------------------------------------------------------
+18. PRE-TOKEN INITIALIZATION — BYTE VALUES vs TOKEN IDs
+-------------------------------------------------------------
+When building pre-tokens for encoding, you must use actual vocab token IDs,
+NOT raw UTF-8 byte values.
+
+WRONG:
+    tuple(m.group().encode('utf-8'))
+    # gives (72, 101, 108, 108, 111) — raw byte integers
+
+RIGHT:
+    tuple(self.reverse_vocab[bytes([b])] for b in m.group().encode('utf-8'))
+    # looks up each byte in reverse_vocab to get its vocab token ID
+
+Why it matters:
+    In your own trained BPE, vocab[i] = bytes([i]) for i in range(256),
+    so token ID == byte value accidentally. But in GPT-2 (or any externally
+    trained vocab), bytes are mapped to arbitrary IDs — e.g. b's' -> ID 82,
+    not 115 (its ASCII value).
+
+Key Python detail:
+    Iterating over a bytes object yields integers, not bytes:
+        for b in b'Hello':   # b is an int (72, 101, ...)
+    To convert back to a single-byte bytes object: bytes([b])
+
+
+-------------------------------------------------------------
+19. REGEX ALTERNATION ORDER — LONGEST MATCH FIRST
+-------------------------------------------------------------
+
+Python's re/regex engine tries alternation left-to-right and stops at first match.
+
+Problem: if shorter special token appears before longer one in the pattern,
+the shorter one always wins:
+    pattern = "<|endoftext|>|<|endoftext|><|endoftext|>"
+    # "<|endoftext|><|endoftext|>" is NEVER matched — shorter consumes it first
+
+Fix: sort special tokens by length descending before joining:
+    sorted(self.special_tokens, key=len, reverse=True)
+
+This applies anywhere you build a regex from a list of string alternatives
+that may overlap or nest (special tokens, keywords, etc.).
+
+
+-------------------------------------------------------------
+20. NN.PARAMETER AND WEIGHT INITIALIZATION
+-------------------------------------------------------------
+Use nn.Parameter to register learnable weights so PyTorch tracks gradients.
+
+  Linear / Embedding: trunc_normal with std = sqrt(2 / (in + out))
+  RMSNorm gain:       torch.ones — gain is a neutral scale, not a projection.
+                      ones = "no scaling initially", learned from there.
+  RoPE:               no learnable weights; precompute sin/cos at init with
+                      register_buffer(persistent=False) so they live on the
+                      right device but aren't saved to state_dict.
+
+
+-------------------------------------------------------------
+21. RMSNORM — DTYPE CASTING FOR NUMERICAL STABILITY
+-------------------------------------------------------------
+Always cast x to float32 before computing RMS, then cast back:
+
+    in_dtype = x.dtype
+    x = x.to(torch.float32)
+    rms = torch.sqrt((x**2).mean(dim=-1, keepdim=True) + self.eps)
+    return (x / rms * self.gain).to(in_dtype)
+
+Why: float16/bfloat16 can overflow when squaring large values.
+Computing in float32 avoids this, then casting back preserves the
+expected output dtype.
+
+
+-------------------------------------------------------------
+22. ELEMENT-WISE * vs MATMUL @ — WHEN TO USE EACH
+-------------------------------------------------------------
+  @ (matmul): MIXES dimensions. Each output is a weighted sum of inputs.
+              Use for linear projections, attention scores, etc.
+
+  * (element-wise): SCALES each element independently. No mixing.
+                    Use for RMSNorm gain, RoPE cos/sin, SwiGLU gating.
+
+Mental model: "combine values across dimensions" -> @
+              "scale values in place"            -> *
+
+
+-------------------------------------------------------------
+23. BROADCASTING — OUTER PRODUCTS AND KEEPDIM
+-------------------------------------------------------------
+PyTorch aligns shapes from the RIGHT when broadcasting.
+
+  (d,) * (b, s, d)  -> (b, s, d)   no unsqueeze needed
+  (m, 1) * (n,)     -> (m, n)       outer product pattern
+
+To get all combinations of two 1D arrays (outer product):
+  reshape one to (m, 1), multiply by (n,) -> (m, n).
+  Mental model: "I want entry [i,j] = a[i] * b[j]" -> make one a column.
+
+keepdim=True in .mean(dim=-1) keeps the dimension as size 1 instead
+of dropping it, so subsequent division broadcasts correctly:
+  (b, s, d).mean(dim=-1, keepdim=True) -> (b, s, 1)  ✓ divides into (b,s,d)
+  (b, s, d).mean(dim=-1)               -> (b, s)      ✗ shape mismatch
+
+
+-------------------------------------------------------------
+24. TENSOR VIEWS vs CLONES — IN-PLACE MUTATION PITFALL
+-------------------------------------------------------------
+Tensor slices are VIEWS into the original memory, not copies.
+Modifying the slice modifies the original, and vice versa.
+
+    x_even = x[:, :, ::2]        # view — shares memory with x
+    x[:, :, ::2] = new_values    # x_even now reflects new_values!
+
+Fix: clone slices you need to use after modifying the source:
+    x_even = x[:, :, ::2].clone()
+    x_odd  = x[:, :, 1::2].clone()
+    x[:, :, ::2]  = x_even * cos - x_odd * sin   # safe
+    x[:, :, 1::2] = x_even * sin + x_odd * cos   # x_even still original
+
+
+-------------------------------------------------------------
+25. SWIGLU FFN — FORWARD PASS STRUCTURE
+-------------------------------------------------------------
+SwiGLU has three weight matrices: W1 (gate), W2 (down), W3 (up).
+W1 and W3 BOTH take the original x as input — don't overwrite x first.
+
+    gate = self.W1(x)
+    return self.W2(gate * torch.sigmoid(gate) * self.W3(x))
+
+SiLU(x) = x * sigmoid(x), so gate * sigmoid(gate) is SiLU applied to gate.
+
+
+-------------------------------------------------------------
+26. ROPE — SKIP BUILDING R, APPLY ROTATION DIRECTLY
+-------------------------------------------------------------
+Naive: build rotation matrix R of shape (seq_len, d_k, d_k) — mostly zeros,
+O(seq_len * d_k^2) memory.
+
+Better: apply the rotation formula directly to element pairs:
+    x_even_new = x_even * cos - x_odd * sin
+    x_odd_new  = x_even * sin + x_odd * cos
+
+General principle: understand what a matrix DOES, then ask if you can
+compute the output without materializing the matrix at all.
+
+token_positions: which sequence positions the input tokens correspond to.
+Usually [0,1,...,seq_len-1], but arbitrary for KV caching. Use it to
+index the precomputed buffers: cos = self.cos_buffer[token_positions].
+
+
+-------------------------------------------------------------
+27. ASSIGNING WEIGHTS TO NESTED SUB-MODULES
+-------------------------------------------------------------
+When a module contains sub-modules (e.g. FFN has Linear objects),
+assign test weights one level deeper — to the parameter inside the sub-module:
+
+    ffn.W1.W = nn.Parameter(w1_weight)   # correct: assigns Linear's weight
+    ffn.W1   = nn.Parameter(w1_weight)   # WRONG: replaces Linear with a tensor
+
+Replacing the sub-module with a raw tensor means forward() will try to
+call the tensor as a function and fail.
+
+
+-------------------------------------------------------------
+28. MULTI-HEAD SELF-ATTENTION — ARCHITECTURE
+-------------------------------------------------------------
+Use 4 Linear layers: WQ, WK, WV (input projections), WO (output projection).
+WQ/WK/WV each project to (num_heads * d_k) in a SINGLE matmul — not one
+per head. The head split happens afterward via rearrange.
+
+    Q = rearrange(WQ(x), "batch seq (h d_k) -> batch h seq d_k", h=num_heads)
+
+The head dimension is treated as a batch dimension inside
+scaled_dot_product_attention — the function sees (..., seq, d_k) and
+handles heads the same as batches.
+
+After attention, rearrange back before WO:
+    concat = rearrange(attn, "batch h seq d -> batch seq (h d)")
+    return WO(concat)
+
+rearrange is a VIEW operation — no data is copied. PyTorch autograd tracks
+it transparently so gradients flow through as if it never happened.
+
+Why one big matmul instead of num_heads small ones:
+  - Efficiency: GPUs prefer large matrix ops over many small ones.
+  - The combined weight matrix learns a richer joint projection.
+
+
+-------------------------------------------------------------
+29. ROPE IN MHA — Q AND K ONLY, NOT V
+-------------------------------------------------------------
+Apply RoPE to Q and K AFTER rearranging to (batch, h, seq, d_k).
+Never apply to V.
+
+Why not V: V stores the content to be aggregated. Position only needs
+to influence WHICH tokens attend to which (via Q·K), not WHAT gets
+retrieved (V).
+
+Why after rearranging: RoPE must rotate each head's d_k independently.
+After rearrange, the last dim is d_k — the right target.
+
+Use x[..., ::2] not x[:, :, ::2] when slicing d_k pairs in RoPE forward.
+The ... matches any number of leading dims, so the same code works for
+both 3D (standalone RoPE test) and 4D (inside MHA with head dim).
+
+token_positions during inference: pass the actual position index of the
+new token (e.g. [100]) rather than [0,1,...] so RoPE rotates it with
+the correct angles. During training, always [0, 1, ..., seq_len-1].
+
+Extend MHA with optional theta/max_seq_len rather than creating a second
+class — avoids duplicating projection and attention logic.
+
+
+-------------------------------------------------------------
+30. TRAINING SANITY CHECK — OVERFIT A SINGLE BATCH
+-------------------------------------------------------------
+Before running full training, verify the model can memorize one batch:
+fix one batch at startup and reuse it every step. Loss should go to ~0.
+
+    if overfit_batch:
+        fixed_inputs, fixed_targets = data_loading(...)   # once
+    for step in ...:
+        inputs, targets = fixed_inputs, fixed_targets     # reuse
+
+What results mean:
+  - Loss drops to near 0       → forward, backward, optimizer all correct
+  - Loss doesn't move          → bug in forward or backward pass
+  - Loss decreases then plateaus → learning rate too low
+  - Loss explodes              → learning rate too high
+
+Use a tiny model (d_model=64, 2 layers) for this check — runs on CPU in
+seconds and is enough to catch wiring bugs.
+
+
+-------------------------------------------------------------
+31. DATA LOADING — SAMPLING EFFICIENCY
+-------------------------------------------------------------
+np.random.choice(n, batch_size, replace=False) is O(n): NumPy scans or
+shuffles the full population to guarantee no duplicates. For a dataset
+with 200M tokens, this takes several seconds per step — a severe bottleneck.
+
+Fix: use np.random.randint(0, n - context_length, batch_size).
+This samples independently, O(batch_size). The collision probability is:
+    batch_size² / (2 * n) ≈ 32² / (2 * 200M) ≈ 0.0000025%
+Negligible in practice. GPT-2, LLaMA, NanoGPT all use replacement sampling.
+
+Symptom of this bug: GPU utilization near 0% despite model being on CUDA,
+because the CPU is spending seconds preparing each batch while the GPU idles.
+
+
+-------------------------------------------------------------
+32. UV + CUDA TORCH SETUP ON WINDOWS
+-------------------------------------------------------------
+pyproject.toml specifies torch without a CUDA index, so uv resolves the
+CPU build by default. uv sync re-applies pyproject.toml on every uv run,
+reverting any manual pip installs of the CUDA build.
+
+Fix: declare the PyTorch CUDA index in pyproject.toml so uv always uses it:
+
+    [tool.uv.sources]
+    torch = { index = "pytorch-cu124" }
+
+    [[tool.uv.index]]
+    name = "pytorch-cu124"
+    url = "https://download.pytorch.org/whl/cu124"
+    explicit = true
+
+On Windows, also add to prevent uv from failing on the Intel Mac torch entry:
+
+    [tool.uv]
+    environments = ["sys_platform == 'win32'"]
+
+After editing pyproject.toml, run: uv sync
+Verify with: uv run python -c "import torch; print(torch.cuda.is_available())"
+
+Two venvs to be aware of:
+  - C:\...\cs336\.venv        — parent-level venv (VIRTUAL_ENV env var)
+  - assignment1-basics\.venv  — project-local venv (what uv run uses)
+  uv pip install targets whichever VIRTUAL_ENV points to; uv run always
+  uses the project-local one. Editing pyproject.toml + uv sync is the
+  correct way to ensure both stay consistent.

@@ -161,3 +161,17 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Local training data and large model artifacts
+/data/
+/checkpoints/
+
+# Local profiling and scratch-analysis artifacts
+*.prof
+/cs336_basics/analyze.ipynb
+/cs336_basics/profile_run.py
+
+# Local crash diagnostics and incomplete experiment attempts
+/logs/diagnostics/
+/logs/controlled/baseline_lr1e-3.csv*
+/logs/controlled/lr3e-4.csv*
